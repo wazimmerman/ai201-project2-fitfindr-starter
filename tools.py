@@ -13,6 +13,7 @@ Tools:
 """
 
 import os
+import re
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -20,6 +21,28 @@ from groq import Groq
 from utils.data_loader import load_listings
 
 load_dotenv()
+
+
+_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "for",
+    "i",
+    "im",
+    "in",
+    "is",
+    "it",
+    "looking",
+    "me",
+    "of",
+    "the",
+    "to",
+    "under",
+    "want",
+    "with",
+}
 
 
 # ── Groq client ───────────────────────────────────────────────────────────────
@@ -32,6 +55,44 @@ def _get_groq_client():
             "GROQ_API_KEY not set. Add it to a .env file in the project root."
         )
     return Groq(api_key=api_key)
+
+
+def _chat_completion(system_prompt: str, user_prompt: str, temperature: float) -> str:
+    """Call Groq and return the assistant text."""
+    client = _get_groq_client()
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=temperature,
+        max_tokens=280,
+    )
+    return response.choices[0].message.content.strip()
+
+
+def _tokens(text: str) -> set[str]:
+    """Normalize user/listing text into searchable keyword tokens."""
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", text.lower())
+        if token not in _STOPWORDS and len(token) > 1
+    }
+
+
+def _listing_text(listing: dict) -> str:
+    fields = [
+        listing.get("title", ""),
+        listing.get("description", ""),
+        listing.get("category", ""),
+        listing.get("size", ""),
+        listing.get("brand") or "",
+        listing.get("platform", ""),
+        " ".join(listing.get("style_tags", [])),
+        " ".join(listing.get("colors", [])),
+    ]
+    return " ".join(fields)
 
 
 # ── Tool 1: search_listings ───────────────────────────────────────────────────
@@ -69,8 +130,35 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    listings = load_listings()
+    query_tokens = _tokens(description)
+    if not query_tokens:
+        return []
+
+    scored_results: list[tuple[int, dict]] = []
+    requested_size = size.lower().strip() if size else None
+
+    for listing in listings:
+        if max_price is not None and float(listing["price"]) > float(max_price):
+            continue
+
+        listing_size = str(listing.get("size", "")).lower()
+        if requested_size and requested_size not in listing_size:
+            continue
+
+        listing_tokens = _tokens(_listing_text(listing))
+        score = len(query_tokens & listing_tokens)
+
+        title_tokens = _tokens(listing.get("title", ""))
+        tag_tokens = _tokens(" ".join(listing.get("style_tags", [])))
+        score += 2 * len(query_tokens & title_tokens)
+        score += len(query_tokens & tag_tokens)
+
+        if score > 0:
+            scored_results.append((score, listing))
+
+    scored_results.sort(key=lambda item: (-item[0], item[1]["price"]))
+    return [listing for _, listing in scored_results]
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
@@ -100,8 +188,63 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    wardrobe_items = wardrobe.get("items", []) if wardrobe else []
+    item_summary = (
+        f"{new_item.get('title')} (${new_item.get('price')}, "
+        f"{new_item.get('platform')}) in {new_item.get('colors')} with tags "
+        f"{new_item.get('style_tags')}"
+    )
+
+    system_prompt = (
+        "You are FitFindr, a practical secondhand styling assistant. "
+        "Give specific, wearable outfit advice in a warm, concise voice."
+    )
+
+    if not wardrobe_items:
+        user_prompt = (
+            "The user has not added wardrobe items yet. Give general styling "
+            f"advice for this thrifted item: {item_summary}. Mention what kinds "
+            "of bottoms, shoes, and layers would work. Keep it to 3-5 sentences."
+        )
+    else:
+        wardrobe_lines = []
+        for item in wardrobe_items:
+            wardrobe_lines.append(
+                "- {name} ({category}; colors: {colors}; tags: {tags}; notes: {notes})".format(
+                    name=item.get("name"),
+                    category=item.get("category"),
+                    colors=", ".join(item.get("colors", [])),
+                    tags=", ".join(item.get("style_tags", [])),
+                    notes=item.get("notes") or "none",
+                )
+            )
+        user_prompt = (
+            f"New thrifted item: {item_summary}\n\n"
+            "User wardrobe:\n"
+            + "\n".join(wardrobe_lines)
+            + "\n\nSuggest 1-2 outfits that use the new item and name specific "
+            "wardrobe pieces. Include styling details like tuck, layering, or proportions."
+        )
+
+    try:
+        return _chat_completion(system_prompt, user_prompt, temperature=0.7)
+    except Exception as exc:
+        if not wardrobe_items:
+            return (
+                f"General styling idea for {new_item.get('title')}: pair it with relaxed denim "
+                "or a simple trouser, add shoes that match its strongest vibe, and use one "
+                "easy layer or accessory to make it feel intentional. "
+                f"(LLM styling unavailable: {exc})"
+            )
+        first_bottom = next((item for item in wardrobe_items if item.get("category") == "bottoms"), None)
+        first_shoe = next((item for item in wardrobe_items if item.get("category") == "shoes"), None)
+        pieces = [piece["name"] for piece in (first_bottom, first_shoe) if piece]
+        piece_text = " and ".join(pieces) if pieces else "simple pieces from your wardrobe"
+        return (
+            f"Try {new_item.get('title')} with {piece_text}. Keep the proportions balanced, "
+            "then add one accessory or light layer to make the outfit feel finished. "
+            f"(LLM styling unavailable: {exc})"
+        )
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -133,5 +276,31 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    if not outfit or not outfit.strip():
+        return (
+            "Cannot create a fit card yet because the outfit suggestion is empty. "
+            "Run suggest_outfit with a selected listing before generating the caption."
+        )
+
+    system_prompt = (
+        "You write casual, authentic OOTD captions for secondhand fashion posts. "
+        "Avoid sounding like an ad."
+    )
+    user_prompt = (
+        "Create a 2-4 sentence caption for this thrifted find.\n\n"
+        f"Item: {new_item.get('title')}\n"
+        f"Price: ${new_item.get('price')}\n"
+        f"Platform: {new_item.get('platform')}\n"
+        f"Outfit idea: {outfit}\n\n"
+        "Mention the item name, price, and platform naturally once each. "
+        "Keep it social-media ready and specific to the outfit vibe."
+    )
+
+    try:
+        return _chat_completion(system_prompt, user_prompt, temperature=1.0)
+    except Exception as exc:
+        return (
+            f"Found {new_item.get('title')} on {new_item.get('platform')} for "
+            f"${new_item.get('price')} and styled it around this vibe: {outfit} "
+            f"(LLM caption unavailable: {exc})"
+        )
